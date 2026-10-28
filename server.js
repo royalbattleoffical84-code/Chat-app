@@ -41,7 +41,56 @@ const payxCfg = async () => (await db.doc('private/payx').get()).data() || {};
 /* ---------- health ---------- */
 app.get('/health', (_, res) => res.json({ ok: true, t: Date.now() }));
 
+/* ---------- LIVE STREAM (Android APK ke liye, Firebase library ke bina) ----------
+   APK ki background service /api/stream (SSE) kholti hai; message/call/broadcast aate hi yaha se turant push hota hai. */
+const streams = new Map(); // uid -> Set(res)
+function streamPush(uids, payload) {
+  const line = `event: push\ndata: ${JSON.stringify(payload)}\n\n`;
+  let n = 0;
+  const send = set => set && set.forEach(r => { try { r.write(line); n++; } catch { } });
+  if (uids === null) streams.forEach(send); else uids.forEach(u => send(streams.get(u)));
+  return n;
+}
+app.get('/api/stream', auth, (req, res) => {
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+  res.flushHeaders?.();
+  const uid = req.user.uid;
+  if (!streams.has(uid)) streams.set(uid, new Set());
+  streams.get(uid).add(res);
+  res.write('event: hello\ndata: {}\n\n');
+  const hb = setInterval(() => { try { res.write(': hb\n\n'); } catch { } }, 20000);
+  req.on('close', () => { clearInterval(hb); const s = streams.get(uid); if (s) { s.delete(res); if (!s.size) streams.delete(uid); } });
+});
+
 /* ---------- PUSH ---------- */
+// web tokens: data-only (service worker notification dikhata hai). native (Android APK) tokens: notification payload, high priority + channel.
+async function pushAll({ web = [], nat = [], uids = [], title, body, data = {}, kind = 'message' }) {
+  const live = uids === null ? streamPush(null, { title, body, ...data, kind: data.kind || kind }) : streamPush(uids, { title, body, ...data, kind: data.kind || kind });
+  const str = o => Object.fromEntries(Object.entries(o).filter(([, v]) => v != null).map(([k, v]) => [k, String(v)]));
+  const dead = []; let sent = 0, failed = 0;
+  const collect = (r, toks) => r.responses.forEach((x, i) => {
+    if (!x.success && /registration-token-not-registered|invalid-argument|invalid-registration/.test(x.error?.code || '')) dead.push(toks[i]);
+  });
+  for (let i = 0; i < web.length; i += 500) {
+    const toks = web.slice(i, i + 500);
+    const r = await admin.messaging().sendEachForMulticast({ tokens: toks, data: str({ ...data, title, body }), android: { priority: 'high' }, webpush: { headers: { Urgency: 'high', TTL: '60' } } });
+    sent += r.successCount; failed += r.failureCount; collect(r, toks);
+  }
+  for (let i = 0; i < nat.length; i += 500) {
+    const toks = nat.slice(i, i + 500);
+    const r = await admin.messaging().sendEachForMulticast({
+      tokens: toks, notification: { title, body }, data: str({ ...data, title, body }),
+      android: { priority: 'high', ttl: kind === 'call' ? 45000 : 86400000, notification: { channelId: kind === 'call' ? 'calls' : 'messages', tag: data.tag || undefined, sound: 'default', defaultVibrateTimings: true, visibility: 'public', notificationCount: 1 } }
+    });
+    sent += r.successCount; failed += r.failureCount; collect(r, toks);
+  }
+  if (dead.length) {
+    const users = await db.collection('users').where('fcmTokens', 'array-contains-any', dead.slice(0, 10)).get().catch(() => ({ docs: [] }));
+    const users2 = await db.collection('users').where('nativeTokens', 'array-contains-any', dead.slice(0, 10)).get().catch(() => ({ docs: [] }));
+    for (const d of [...users.docs, ...users2.docs]) await d.ref.update({ fcmTokens: admin.firestore.FieldValue.arrayRemove(...dead), nativeTokens: admin.firestore.FieldValue.arrayRemove(...dead) }).catch(() => { });
+  }
+  return { sent: sent + live, failed, live };
+}
 app.post('/api/notify', auth, wrap(async (req, res) => {
   const { kind = 'message', chatId, callId } = req.body || {};
   const uid = req.user.uid;
@@ -62,26 +111,18 @@ app.post('/api/notify', auth, wrap(async (req, res) => {
     body = (chat.isGroup ? `${me.name}: ` : '') + (lm.text || 'Naya message');
     data = { kind: 'message', chatId, tag: chatId };
   }
-  const tokens = [], owner = {};
+  const web = [], nat = [], uids = [];
   for (const t of targets) {
     const u = (await db.doc(`users/${t}`).get()).data();
     if (!u || u.banned) continue;
     if (kind !== 'call' && (u.muted || []).includes(chatId)) continue;
-    (u.fcmTokens || []).forEach(k => { tokens.push(k); owner[k] = t; });
+    if ((u.blocked || []).includes(uid)) continue;
+    uids.push(t);
+    (u.fcmTokens || []).forEach(k => web.push(k));
+    (u.nativeTokens || []).forEach(k => nat.push(k));
   }
-  if (!tokens.length) return res.json({ sent: 0 });
-  const r = await admin.messaging().sendEachForMulticast({
-    tokens,
-    data: { ...data, title, body: body.slice(0, 160) },
-    android: { priority: 'high' },
-    webpush: { headers: { Urgency: 'high', TTL: '60' } }
-  });
-  const dead = [];
-  r.responses.forEach((x, i) => {
-    if (!x.success && /registration-token-not-registered|invalid-argument|invalid-registration/.test(x.error?.code || '')) dead.push(tokens[i]);
-  });
-  for (const k of dead) await db.doc(`users/${owner[k]}`).update({ fcmTokens: admin.firestore.FieldValue.arrayRemove(k) }).catch(() => {});
-  res.json({ sent: r.successCount, failed: r.failureCount });
+  const out = await pushAll({ web, nat, uids, title, body: body.slice(0, 160), data, kind });
+  res.json(out);
 }));
 
 /* ---------- PAYMENTS (payX) ---------- */
@@ -142,6 +183,25 @@ async function checkPayx(orderId, order, cfg) {
   return 'pending';
 }
 async function activate(orderId) {
+  const r = await activateTx(orderId);
+  if (r === 'activated') {
+    const p = (await db.doc(`payments/${orderId}`).get()).data() || {};
+    pushUser(p.uid, 'Premium active ✔', `${p.planName || 'Plan'} activate ho gaya`, { kind: 'broadcast', tag: 'pay' }).catch(() => { });
+    pushAdmins('New payment', `${p.planName || 'Plan'} • ₹${p.amount || ''} • ${p.phone || p.uid || ''}`).catch(() => { });
+  }
+  return r;
+}
+async function pushUser(uid, title, body, data = {}) {
+  if (!uid) return;
+  const u = (await db.doc(`users/${uid}`).get()).data() || {};
+  return pushAll({ web: u.fcmTokens || [], nat: u.nativeTokens || [], uids: [uid], title, body, data });
+}
+async function pushAdmins(title, body) {
+  const s = await db.collection('users').where('role', '==', 'admin').get();
+  const web = [], nat = [], uids = []; s.forEach(d => { uids.push(d.id); const u = d.data(); (u.fcmTokens || []).forEach(t => web.push(t)); (u.nativeTokens || []).forEach(t => nat.push(t)); });
+  return pushAll({ web, nat, uids, title, body, data: { kind: 'broadcast', tag: 'admin' } });
+}
+async function activateTx(orderId) {
   const ref = db.doc(`payments/${orderId}`);
   return db.runTransaction(async tx => {
     const p = await tx.get(ref); const o = p.data();
@@ -212,20 +272,16 @@ app.post('/api/admin/broadcast', auth, adminOnly, wrap(async (req, res) => {
   const { title, body, uid } = req.body || {};
   if (!title) return res.status(400).json({ error: 'title do' });
   const snap = uid ? [await db.doc(`users/${uid}`).get()] : (await db.collection('users').get()).docs;
-  const tokens = []; snap.forEach(d => (d.data()?.fcmTokens || []).forEach(t => tokens.push(t)));
-  let sent = 0;
-  for (let i = 0; i < tokens.length; i += 500) {
-    const r = await admin.messaging().sendEachForMulticast({ tokens: tokens.slice(i, i + 500), data: { kind: 'broadcast', title, body: body || '', tag: 'broadcast' } });
-    sent += r.successCount;
-  }
-  res.json({ sent, tokens: tokens.length });
+  const web = [], nat = []; snap.forEach(d => { const u = d.data() || {}; (u.fcmTokens || []).forEach(t => web.push(t)); (u.nativeTokens || []).forEach(t => nat.push(t)); });
+  const r = await pushAll({ web, nat, uids: uid ? [uid] : null, title, body: body || '', data: { kind: 'broadcast', tag: 'broadcast' }, kind: 'message' });
+  res.json({ sent: r.sent, tokens: web.length + nat.length + r.live });
 }));
 
 /* ---------- cleanup (jab server awake ho): expired status + purani calls ---------- */
 async function cleanup() {
   try {
     const st = await db.collection('statuses').where('exp', '<', Date.now()).limit(200).get();
-    for (const d of st.docs) await d.ref.delete();
+    for (const d of st.docs) { const x = d.data(); if (x.fid) await db.recursiveDelete(db.doc(`files/${x.fid}`)).catch(() => { }); await d.ref.delete(); }
     const old = await db.collection('calls').where('cts', '<', Date.now() - 30 * 864e5).limit(200).get();
     for (const d of old.docs) await db.recursiveDelete(d.ref);
   } catch (e) { console.warn('cleanup', e.message); }
