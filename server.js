@@ -96,6 +96,12 @@ app.post('/api/notify', auth, wrap(async (req, res) => {
   const uid = req.user.uid;
   const me = (await db.doc(`users/${uid}`).get()).data() || {};
   let targets = [], title = '', body = '', data = {};
+  if (kind === 'callend') {
+    const c = (await db.doc(`calls/${callId}`).get()).data();
+    if (!c || c.from !== uid) return res.status(403).json({ error: 'Invalid call' });
+    streamPush([c.to], { kind: 'callend', callId, tag: callId });
+    return res.json({ ok: true });
+  }
   if (kind === 'call') {
     const c = (await db.doc(`calls/${callId}`).get()).data();
     if (!c || c.from !== uid) return res.status(403).json({ error: 'Invalid call' });
@@ -123,6 +129,15 @@ app.post('/api/notify', auth, wrap(async (req, res) => {
   }
   const out = await pushAll({ web, nat, uids, title, body: body.slice(0, 160), data, kind });
   res.json(out);
+}));
+
+// Notification ke "Decline" button se (app khole bina) call reject
+app.post('/api/call/decline', auth, wrap(async (req, res) => {
+  const ref = db.doc(`calls/${String(req.body.callId || '')}`);
+  const c = (await ref.get()).data();
+  if (!c || c.to !== req.user.uid) return res.status(403).json({ error: 'Invalid call' });
+  if (c.status === 'ringing') await ref.update({ status: 'rejected' });
+  res.json({ ok: true });
 }));
 
 /* ---------- PAYMENTS (payX) ---------- */
