@@ -36,7 +36,12 @@ const pick = (o, paths) => {
   }
 };
 const settings = async () => (await db.doc('settings/app').get()).data() || {};
-const payxCfg = async () => (await db.doc('private/payx').get()).data() || {};
+// Sab kuch pehle se set hai - admin ko sirf apiKey daalni hoti hai. Admin panel ke Advanced me override kar sakte hain.
+const PAYX_DEF = { baseUrl: 'https://payx-q1nn.onrender.com', authHeader: 'X-PayX-Key', createPath: '/api/v1/orders', statusPath: '/api/v1/orders/:id', statusMethod: 'GET', currency: 'INR' };
+const payxCfg = async () => {
+  const d = (await db.doc('private/payx').get()).data() || {};
+  return { ...PAYX_DEF, ...Object.fromEntries(Object.entries(d).filter(([, v]) => v !== '' && v != null)) };
+};
 
 /* ---------- health ---------- */
 app.get('/health', (_, res) => res.json({ ok: true, t: Date.now() }));
@@ -148,10 +153,12 @@ function payxHeaders(c) {
   return h;
 }
 const joinUrl = (b, p) => b.replace(/\/$/, '') + (p.startsWith('/') ? p : '/' + p);
-async function callPayx(cfg, method, path, payload) {
+async function callPayx(cfg, method, path, payload, vars) {
+  const hasVar = /:id|:orderId|\{id\}|\{orderId\}/.test(path);
+  if (hasVar && vars && vars.id) path = path.replace(/:orderId|:id|\{orderId\}|\{id\}/g, encodeURIComponent(vars.id));
   let url = joinUrl(cfg.baseUrl, path);
   const opt = { method, headers: payxHeaders(cfg) };
-  if (method === 'GET') { url += (url.includes('?') ? '&' : '?') + new URLSearchParams(payload).toString(); } else opt.body = JSON.stringify(payload);
+  if (method === 'GET' && hasVar) { /* id path me hai */ } else if (method === 'GET') { url += (url.includes('?') ? '&' : '?') + new URLSearchParams(payload).toString(); } else opt.body = JSON.stringify(payload);
   const r = await fetch(url, opt);
   const txt = await r.text(); let j = {}; try { j = JSON.parse(txt); } catch { j = { raw: txt.slice(0, 300) }; }
   return { ok: r.ok, status: r.status, json: j };
@@ -174,8 +181,8 @@ app.post('/api/pay/create', auth, wrap(async (req, res) => {
     redirect_url: cfg.redirectUrl || st.appUrl || '', return_url: cfg.redirectUrl || st.appUrl || '',
     callback_url: cb, webhook_url: cb, metadata: { uid: req.user.uid, planId }
   };
-  const r = await callPayx(cfg, 'POST', cfg.createPath || '/api/create-order', payload);
-  if (!r.ok) return res.status(502).json({ error: `payX error ${r.status}: ${pick(r.json, ['message', 'error', 'raw']) || ''}` });
+  const r = await callPayx(cfg, 'POST', cfg.createPath, payload);
+  if (!r.ok) return res.status(502).json({ error: `payX error ${r.status}: ${pick(r.json, ['message', 'error', 'detail', 'raw']) || JSON.stringify(r.json).slice(0, 200)}` });
   const paymentUrl = pick(r.json, ['payment_url', 'paymentUrl', 'url', 'link', 'checkout_url', 'payment_link', 'data.payment_url', 'data.paymentUrl', 'data.url', 'data.link', 'data.checkout_url']);
   const gatewayId = pick(r.json, ['order_id', 'orderId', 'id', 'data.order_id', 'data.orderId', 'data.id']);
   if (!paymentUrl) return res.status(502).json({ error: 'payX ne payment URL nahi diya. Admin panel me create path / response check karo.' });
@@ -191,7 +198,7 @@ const BAD = ['failed', 'failure', 'cancelled', 'canceled', 'expired', 'rejected'
 async function checkPayx(orderId, order, cfg) {
   const q = { order_id: order.gatewayOrderId || orderId, orderId: order.gatewayOrderId || orderId };
   const method = (cfg.statusMethod || 'GET').toUpperCase();
-  const r = await callPayx(cfg, method, cfg.statusPath || '/api/order-status', q);
+  const r = await callPayx(cfg, method, cfg.statusPath, q, { id: order.gatewayOrderId || orderId });
   const s = String(pick(r.json, ['status', 'payment_status', 'paymentStatus', 'order_status', 'data.status', 'data.payment_status', 'state']) || '').toLowerCase();
   if (OK.includes(s)) return 'success';
   if (BAD.includes(s)) return 'failed';
@@ -262,12 +269,15 @@ app.all('/api/pay/webhook', wrap(async (req, res) => {
 }));
 app.post('/api/pay/test', auth, adminOnly, wrap(async (req, res) => {
   const cfg = await payxCfg();
-  if (!cfg.baseUrl) return res.status(400).json({ error: 'Base URL set nahi hai' });
+  if (!cfg.apiKey) return res.status(400).json({ error: 'Pehle PayX API key daalo' });
   const t0 = Date.now();
   try {
-    const r = await fetch(cfg.baseUrl, { headers: payxHeaders(cfg) });
-    res.json({ ok: r.ok, status: r.status, ms: Date.now() - t0, body: (await r.text()).slice(0, 200) });
-  } catch (e) { res.status(502).json({ error: 'payX reach nahi hua: ' + e.message }); }
+    const r = await callPayx(cfg, (cfg.statusMethod || 'GET').toUpperCase(), cfg.statusPath, { order_id: 'TEST' }, { id: 'TEST' });
+    const ms = Date.now() - t0;
+    // 401/403 = key ya header galat. 404/400/422 = server tak pahunch gaye, key sahi (order TEST hai hi nahi).
+    const auth = (r.status === 401 || r.status === 403) ? 'bad' : (r.status >= 500 ? 'unknown' : 'ok');
+    res.json({ ok: auth === 'ok', auth, status: r.status, ms, body: JSON.stringify(r.json).slice(0, 200) });
+  } catch (e) { res.status(502).json({ error: 'PayX reach nahi hua (server so raha ho sakta hai, 1 min baad try karo): ' + e.message }); }
 }));
 app.post('/api/admin/activate', auth, adminOnly, wrap(async (req, res) => res.json({ result: await activate(String(req.body.orderId)) })));
 
