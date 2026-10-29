@@ -175,7 +175,8 @@ app.post('/api/pay/create', auth, wrap(async (req, res) => {
   const orderId = 'ORD' + Date.now() + Math.random().toString(36).slice(2, 6).toUpperCase();
   const cb = `${PUBLIC_URL}/api/pay/webhook${cfg.webhookSecret ? '?secret=' + encodeURIComponent(cfg.webhookSecret) : ''}`;
   const payload = {
-    order_id: orderId, orderId, amount: Number(plan.price), currency: cfg.currency || 'INR',
+    amount: Number(plan.price), reference: orderId, note: `${plan.name} plan`, redirectUrl: cfg.redirectUrl || st.appUrl || '',
+    order_id: orderId, orderId, currency: cfg.currency || 'INR',
     customer_name: user.name || 'User', customer_mobile: user.phone, customer_phone: user.phone,
     description: `${plan.name} plan`, note: `${plan.name} plan`,
     redirect_url: cfg.redirectUrl || st.appUrl || '', return_url: cfg.redirectUrl || st.appUrl || '',
@@ -183,8 +184,8 @@ app.post('/api/pay/create', auth, wrap(async (req, res) => {
   };
   const r = await callPayx(cfg, 'POST', cfg.createPath, payload);
   if (!r.ok) return res.status(502).json({ error: `payX error ${r.status}: ${pick(r.json, ['message', 'error', 'detail', 'raw']) || JSON.stringify(r.json).slice(0, 200)}` });
-  const paymentUrl = pick(r.json, ['payment_url', 'paymentUrl', 'url', 'link', 'checkout_url', 'payment_link', 'data.payment_url', 'data.paymentUrl', 'data.url', 'data.link', 'data.checkout_url']);
-  const gatewayId = pick(r.json, ['order_id', 'orderId', 'id', 'data.order_id', 'data.orderId', 'data.id']);
+  const paymentUrl = pick(r.json, ['order.checkoutUrl', 'checkoutUrl', 'payment_url', 'paymentUrl', 'url', 'link', 'checkout_url', 'payment_link', 'data.payment_url', 'data.paymentUrl', 'data.url', 'data.link', 'data.checkout_url']);
+  const gatewayId = pick(r.json, ['order.id', 'order_id', 'orderId', 'id', 'data.order_id', 'data.orderId', 'data.id']);
   if (!paymentUrl) return res.status(502).json({ error: 'payX ne payment URL nahi diya. Admin panel me create path / response check karo.' });
   await db.doc(`payments/${orderId}`).set({
     uid: req.user.uid, planId, planName: plan.name, amount: Number(plan.price), status: 'pending',
@@ -199,8 +200,9 @@ async function checkPayx(orderId, order, cfg) {
   const q = { order_id: order.gatewayOrderId || orderId, orderId: order.gatewayOrderId || orderId };
   const method = (cfg.statusMethod || 'GET').toUpperCase();
   const r = await callPayx(cfg, method, cfg.statusPath, q, { id: order.gatewayOrderId || orderId });
-  const s = String(pick(r.json, ['status', 'payment_status', 'paymentStatus', 'order_status', 'data.status', 'data.payment_status', 'state']) || '').toLowerCase();
-  if (OK.includes(s)) return 'success';
+  const s = String(pick(r.json, ['order.status', 'status', 'payment_status', 'paymentStatus', 'order_status', 'data.status', 'data.payment_status', 'state']) || '').toLowerCase();
+  const amt = pick(r.json, ['order.amount', 'amount', 'data.amount']);
+  if (OK.includes(s)) { if (amt != null && order.amount != null && Number(amt) !== Number(order.amount)) { console.warn('PayX amount mismatch', orderId); return 'pending'; } return 'success'; }
   if (BAD.includes(s)) return 'failed';
   return 'pending';
 }
