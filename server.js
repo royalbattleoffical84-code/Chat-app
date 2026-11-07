@@ -49,11 +49,17 @@ app.get('/health', (_, res) => res.json({ ok: true, t: Date.now() }));
 /* ---------- LIVE STREAM (Android APK ke liye, Firebase library ke bina) ----------
    APK ki background service /api/stream (SSE) kholti hai; message/call/broadcast aate hi yaha se turant push hota hai. */
 const streams = new Map(); // uid -> Set(res)
+const missed = new Map(); // uid -> [{t,p}]  (phone offline/killed tha: wapas judte hi mil jaye)
+const MISS_TTL = 6 * 3600e3;
 function streamPush(uids, payload) {
   const line = `event: push\ndata: ${JSON.stringify(payload)}\n\n`;
   let n = 0;
   const send = set => set && set.forEach(r => { try { r.write(line); n++; } catch { } });
-  if (uids === null) streams.forEach(send); else uids.forEach(u => send(streams.get(u)));
+  if (uids === null) streams.forEach(send);
+  else uids.forEach(u => {
+    const s = streams.get(u); const before = n; send(s);
+    if (n === before && payload.kind !== 'callend' && payload.kind !== 'call') { const a = missed.get(u) || []; a.push({ t: Date.now(), p: payload }); missed.set(u, a.slice(-30)); }
+  });
   return n;
 }
 app.get('/api/stream', auth, (req, res) => {
@@ -63,6 +69,8 @@ app.get('/api/stream', auth, (req, res) => {
   if (!streams.has(uid)) streams.set(uid, new Set());
   streams.get(uid).add(res);
   res.write('event: hello\ndata: {}\n\n');
+  const q = (missed.get(uid) || []).filter(x => Date.now() - x.t < MISS_TTL); missed.delete(uid);
+  q.forEach(x => { try { res.write(`event: push\ndata: ${JSON.stringify({ ...x.p, late: true })}\n\n`); } catch { } });
   const hb = setInterval(() => { try { res.write(': hb\n\n'); } catch { } }, 20000);
   req.on('close', () => { clearInterval(hb); const s = streams.get(uid); if (s) { s.delete(res); if (!s.size) streams.delete(uid); } });
 });
